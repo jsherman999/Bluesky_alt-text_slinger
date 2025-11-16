@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+atproto
+python-multipart
+openai

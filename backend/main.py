@@ -5,8 +5,16 @@ from typing import List, Optional, Dict
 
 from atproto import Client
 
-from .alt_text_gen import is_enabled as altgen_is_enabled, generate_alt_text
-from . import db
+try:
+    from .alt_text_gen import is_enabled as altgen_is_enabled, generate_alt_text
+    from . import db
+except ImportError:  # Allows running as a script from backend/ during dev
+    import os
+    import sys
+
+    sys.path.append(os.path.dirname(__file__))
+    from alt_text_gen import is_enabled as altgen_is_enabled, generate_alt_text
+    import db
 
 
 # ---------- Pydantic models ----------

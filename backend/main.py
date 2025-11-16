@@ -86,6 +86,13 @@ db.init_db()
 
 # ---------- Helpers ----------
 
+
+@app.get("/")
+def root_health() -> dict:
+    """Lightweight health/ready check for curl or container monitors."""
+    return {"status": "ok"}
+
+
 def parse_at_uri(uri: str):
     """
     Parse an AT URI of the form:

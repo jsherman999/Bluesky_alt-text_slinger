@@ -54,7 +54,7 @@ pip install -r requirements.txt
 export OPENAI_API_KEY="sk-..."           # required for suggestions
 export ALTTS_DB_PATH="./alttext_slinger.db"  # optional; defaults to backend-local file
 
-uvicorn backend.main:app --reload --port 8000
+uvicorn main:app --reload --port 8000
 
 The API will be available at http://localhost:8000.
 

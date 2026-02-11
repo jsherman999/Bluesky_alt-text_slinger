@@ -307,6 +307,51 @@ def _extract_record_alt_from_payload(payload: dict) -> List[dict]:
     return out
 
 
+def _extract_postview_alt_from_payload(payload: dict) -> List[dict]:
+    posts = payload.get("posts") or []
+    if not posts:
+        return []
+    post = posts[0] or {}
+    embed = post.get("embed") or {}
+    embed_type = embed.get("$type") or embed.get("py_type") or ""
+    images = []
+    if embed_type == "app.bsky.embed.images#view":
+        images = embed.get("images") or []
+    elif embed_type == "app.bsky.embed.recordWithMedia#view":
+        media = embed.get("media") or {}
+        if (media.get("$type") or media.get("py_type") or "") == "app.bsky.embed.images#view":
+            images = media.get("images") or []
+    out = []
+    for idx, img in enumerate(images):
+        out.append({"index": idx, "alt": (img or {}).get("alt") or ""})
+    return out
+
+
+def _extract_type_debug(payload: dict) -> dict:
+    value = payload.get("value") or payload.get("record") or {}
+    embed = value.get("embed") or {}
+    out: dict = {
+        "record_type_dollar": value.get("$type"),
+        "record_type_py": value.get("py_type"),
+        "embed_type_dollar": embed.get("$type"),
+        "embed_type_py": embed.get("py_type"),
+        "embed_keys": list(embed.keys()) if isinstance(embed, dict) else [],
+    }
+    images = []
+    if (embed.get("$type") or embed.get("py_type") or "") == "app.bsky.embed.images":
+        images = embed.get("images") or []
+    elif (embed.get("$type") or embed.get("py_type") or "") == "app.bsky.embed.recordWithMedia":
+        media = embed.get("media") or {}
+        out["media_type_dollar"] = media.get("$type")
+        out["media_type_py"] = media.get("py_type")
+        if (media.get("$type") or media.get("py_type") or "") == "app.bsky.embed.images":
+            images = media.get("images") or []
+    if images:
+        first = images[0] or {}
+        out["image0_keys"] = list(first.keys()) if isinstance(first, dict) else []
+    return out
+
+
 def debug_compare_alt_views(uri: str) -> dict:
     did, collection, rkey = parse_at_uri(uri)
 
@@ -345,17 +390,29 @@ def debug_compare_alt_views(uri: str) -> dict:
     public_thread = _fetch_json_url(public_thread_url)
     thread_post = ((public_thread.get("thread") or {}).get("post") or {})
     thread_record = {"record": thread_post.get("record") or {}}
+    public_posts_url = (
+        "https://public.api.bsky.app/xrpc/app.bsky.feed.getPosts"
+        f"?uris={urllib.parse.quote(uri, safe='')}"
+    )
+    public_posts_payload = _fetch_json_url(public_posts_url)
 
     return {
         "uri": uri,
         "did": did,
         "pds_endpoint": pds_endpoint,
+        "pds_cid": (pds_record or {}).get("cid"),
+        "public_repo_cid": (public_repo_record or {}).get("cid"),
         "pds_record_url": pds_record_url,
         "public_repo_url": public_repo_url,
         "public_thread_url": public_thread_url,
+        "public_posts_url": public_posts_url,
         "pds_record_alts": _extract_record_alt_from_payload(pds_record) if pds_record else [],
         "public_repo_alts": _extract_record_alt_from_payload(public_repo_record),
         "public_thread_record_alts": _extract_record_alt_from_payload(thread_record),
+        "public_posts_view_alts": _extract_postview_alt_from_payload(public_posts_payload),
+        "pds_type_debug": _extract_type_debug(pds_record) if pds_record else {},
+        "public_repo_type_debug": _extract_type_debug(public_repo_record),
+        "public_thread_type_debug": _extract_type_debug(thread_record),
     }
 
 
@@ -427,6 +484,27 @@ def get_field(obj: Any, *keys: str) -> Any:
 
 def get_type_name(obj: Any) -> str:
     return get_field(obj, "$type", "py_type") or ""
+
+
+def canonicalize_for_atproto(value: Any) -> Any:
+    """
+    Normalize SDK-shaped payloads into canonical ATProto JSON:
+    - recursively map `py_type` -> `$type`
+    - drop null fields
+    """
+    if isinstance(value, list):
+        return [canonicalize_for_atproto(v) for v in value]
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            if v is None:
+                continue
+            key = "$type" if k == "py_type" else k
+            out[key] = canonicalize_for_atproto(v)
+        if "$type" not in out and "py_type" in value and value.get("py_type"):
+            out["$type"] = value.get("py_type")
+        return out
+    return value
 
 
 def extract_image_views_from_post(post: Any) -> List[Any]:
@@ -899,6 +977,7 @@ def _apply_updates_for_uri(
         record = record.model_dump(by_alias=True, exclude_none=True)
     elif not isinstance(record, dict):
         raise RuntimeError(f"Unsupported record object type: {type(record)}")
+    record = canonicalize_for_atproto(record)
 
     embed = record.get("embed")
     if not embed:
@@ -1123,6 +1202,7 @@ def _run_apply_queue_worker(job_id: str) -> None:
 
     last_run_at = 0.0
     last_propagation_check_at = 0.0
+    max_propagation_checks = 36  # ~6 minutes at 10s cadence before hard failure
     while True:
         with APPLY_JOBS_LOCK:
             rt = APPLY_JOBS.get(job_id)
@@ -1191,6 +1271,43 @@ def _run_apply_queue_worker(job_id: str) -> None:
                             new_alt=row["new_alt"],
                             status="applied",
                         )
+                else:
+                    next_attempt = max(int(x.get("attempts", 0)) for x in prop_group) + 1
+                    if next_attempt >= max_propagation_checks:
+                        fail_msg = (
+                            "Public appview did not reflect PDS alt updates after repeated checks. "
+                            f"Last verify: {pub_err}"
+                        )
+                        print(f"[apply-queue] Propagation timeout for {p_uri}: {fail_msg}")
+                        db.mark_apply_items(
+                            job_id,
+                            p_uri,
+                            [
+                                {"image_index": int(x["image_index"]), "status": "failed", "error": fail_msg}
+                                for x in prop_group
+                            ],
+                        )
+                        for row in prop_group:
+                            db.record_image_update(
+                                handle=handle,
+                                uri=p_uri,
+                                image_index=int(row["image_index"]),
+                                new_alt=row["new_alt"],
+                                status="failed",
+                            )
+                    else:
+                        db.mark_apply_items(
+                            job_id,
+                            p_uri,
+                            [
+                                {
+                                    "image_index": int(x["image_index"]),
+                                    "status": "propagating",
+                                    "error": f"{pub_err} (check {next_attempt}/{max_propagation_checks})",
+                                }
+                                for x in prop_group
+                            ],
+                        )
                 last_propagation_check_at = now
 
         claimed = db.claim_next_pending_uri_group(job_id)
@@ -1201,10 +1318,12 @@ def _run_apply_queue_worker(job_id: str) -> None:
             if db.has_propagating_apply_items(job_id):
                 db.set_apply_job_status(
                     job_id,
-                    "paused",
+                    "running",
                     pause_reason="Waiting for Bluesky appview propagation",
                     rate_limit_reset_at=None,
                 )
+                time.sleep(1.0)
+                continue
             else:
                 db.set_apply_job_status(job_id, "completed", pause_reason=None, rate_limit_reset_at=None)
             return

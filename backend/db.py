@@ -439,7 +439,7 @@ def mark_apply_items(
         status = res["status"]
         error = res.get("error")
         idx = res["image_index"]
-        attempts_inc = 1 if status in {"failed", "pending"} else 0
+        attempts_inc = 1 if status in {"failed", "pending", "propagating"} else 0
         cur.execute(
             """
             UPDATE apply_job_items

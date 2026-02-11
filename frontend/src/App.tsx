@@ -103,7 +103,7 @@ const App: React.FC = () => {
   const applyPollTimerRef = useRef<number | null>(null);
   const altStateRef = useRef<AltStateMap>({});
   const scanMapRef = useRef<HTMLDivElement | null>(null);
-  const dotRefs = useRef<Record<string, HTMLAnchorElement | null>>({});
+  const dotRefs = useRef<Record<string, HTMLButtonElement | null>>({});
 
   useEffect(() => {
     altStateRef.current = altState;
@@ -118,13 +118,18 @@ const App: React.FC = () => {
     const cRect = container.getBoundingClientRect();
     const eRect = el.getBoundingClientRect();
     const margin = 12;
-    const outOfView =
-      eRect.top < cRect.top + margin ||
-      eRect.bottom > cRect.bottom - margin ||
-      eRect.left < cRect.left + margin ||
-      eRect.right > cRect.right - margin;
-    if (outOfView) {
-      el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+    const outVertical = eRect.top < cRect.top + margin || eRect.bottom > cRect.bottom - margin;
+    const outHorizontal = eRect.left < cRect.left + margin || eRect.right > cRect.right - margin;
+    if (outVertical || outHorizontal) {
+      const targetTop = el.offsetTop - (container.clientHeight - el.offsetHeight) / 2;
+      const targetLeft = el.offsetLeft - (container.clientWidth - el.offsetWidth) / 2;
+      const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      const maxLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+      container.scrollTo({
+        top: outVertical ? Math.max(0, Math.min(maxTop, targetTop)) : container.scrollTop,
+        left: outHorizontal ? Math.max(0, Math.min(maxLeft, targetLeft)) : container.scrollLeft,
+        behavior: "smooth"
+      });
     }
   }, [activeGenerationUri, activeApplyUri, scanCircles]);
 
@@ -972,11 +977,16 @@ const App: React.FC = () => {
                       const queueLabel = getPostQueueSummary(circle.uri);
                       const tooltip = `${statusLabel}\n${pendingLabel}\n${queueLabel}\n${circle.uri}`;
                       return (
-                        <a
+                        <button
+                          type="button"
                           key={`${circle.uri}-${idx}`}
-                          href={atUriToBskyWebUrl(circle.uri, result?.handle || handle)}
-                          target="_blank"
-                          rel="noreferrer"
+                          onClick={() =>
+                            window.open(
+                              atUriToBskyWebUrl(circle.uri, result?.handle || handle),
+                              "_blank",
+                              "noopener,noreferrer"
+                            )
+                          }
                           ref={(el) => {
                             dotRefs.current[circle.uri] = el;
                           }}

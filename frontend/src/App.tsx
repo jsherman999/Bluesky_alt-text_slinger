@@ -1,13 +1,22 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import "./App.css";
 import {
-  scanImages,
+  scanImagesWithProgress,
   ScanResponse,
   PostInfo,
   ImageInfo,
-  applyAltUpdates,
+  startApplyQueue,
+  getApplyQueueState,
+  pauseApplyQueue,
+  resumeApplyQueue,
   AltUpdate,
-  ApplyResponse
+  ApplyQueueStateResponse,
+  ScanProgressEvent,
+  startAltGeneration,
+  pollAltGenerationEvents,
+  stopAltGeneration,
+  GenerateJobEvent,
+  regenerateAltText
 } from "./api";
 
 function formatDate(dateStr?: string | null): string {
@@ -20,6 +29,7 @@ function formatDate(dateStr?: string | null): string {
 type AltState = {
   apply: boolean;
   draftAlt: string;
+  userEdited: boolean;
 };
 
 type AltStateMap = {
@@ -30,7 +40,32 @@ function makeKey(uri: string, index: number): string {
   return `${uri}::${index}`;
 }
 
+function atUriToBskyWebUrl(uri: string, fallbackHandle?: string): string {
+  if (!uri.startsWith("at://")) return uri;
+  const parts = uri.slice(5).split("/");
+  if (parts.length !== 3) return uri;
+  const repo = parts[0];
+  const collection = parts[1];
+  const rkey = parts[2];
+  if (collection !== "app.bsky.feed.post") return uri;
+  const profile = repo.startsWith("did:") && fallbackHandle ? fallbackHandle : repo;
+  return `https://bsky.app/profile/${profile}/post/${rkey}`;
+}
+
 type FilterMode = "all" | "missingAlt" | "hasAlt" | "selected";
+type ScanStats = {
+  postsScanned: number;
+  imagesFound: number;
+};
+
+type GenStatus = "queued" | "generating" | "done" | "error";
+type ApplyItemStatus = "idle" | "pending" | "propagating" | "running" | "applied" | "failed";
+type CircleStatus = "black" | "red" | "darkgreen" | "green";
+type ScanCircle = {
+  uri: string;
+  status: CircleStatus;
+  missingPending: number;
+};
 
 const App: React.FC = () => {
   const [handle, setHandle] = useState("");
@@ -42,9 +77,352 @@ const App: React.FC = () => {
   const [result, setResult] = useState<ScanResponse | null>(null);
   const [altState, setAltState] = useState<AltStateMap>({});
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
+  const [scanLogLines, setScanLogLines] = useState<string[]>([]);
+  const [scanCircles, setScanCircles] = useState<ScanCircle[]>([]);
+  const [scanStats, setScanStats] = useState<ScanStats>({
+    postsScanned: 0,
+    imagesFound: 0
+  });
+  const [generationJobId, setGenerationJobId] = useState<string | null>(null);
+  const [generationRunning, setGenerationRunning] = useState(false);
+  const [generationStopping, setGenerationStopping] = useState(false);
+  const [generationProcessed, setGenerationProcessed] = useState(0);
+  const [generationTotal, setGenerationTotal] = useState(0);
+  const [applyProcessed, setApplyProcessed] = useState(0);
+  const [applyTotal, setApplyTotal] = useState(0);
+  const [applyJobId, setApplyJobId] = useState<string | null>(null);
+  const [applyQueueState, setApplyQueueState] = useState<ApplyQueueStateResponse | null>(null);
+  const [applyItemStatus, setApplyItemStatus] = useState<Record<string, ApplyItemStatus>>({});
+  const [imageGenStatus, setImageGenStatus] = useState<Record<string, GenStatus>>({});
+  const [imageGenError, setImageGenError] = useState<Record<string, string>>({});
+  const [regeneratingKeyMap, setRegeneratingKeyMap] = useState<Record<string, boolean>>({});
+  const [activeGenerationUri, setActiveGenerationUri] = useState<string | null>(null);
+  const [activeApplyUri, setActiveApplyUri] = useState<string | null>(null);
+  const lastGenSeqRef = useRef(0);
+  const pollTimerRef = useRef<number | null>(null);
+  const applyPollTimerRef = useRef<number | null>(null);
+  const altStateRef = useRef<AltStateMap>({});
+  const scanMapRef = useRef<HTMLDivElement | null>(null);
+  const dotRefs = useRef<Record<string, HTMLAnchorElement | null>>({});
+
+  useEffect(() => {
+    altStateRef.current = altState;
+  }, [altState]);
+
+  useEffect(() => {
+    const activeUri = activeApplyUri || activeGenerationUri;
+    if (!activeUri) return;
+    const container = scanMapRef.current;
+    const el = dotRefs.current[activeUri];
+    if (!container || !el) return;
+    const cRect = container.getBoundingClientRect();
+    const eRect = el.getBoundingClientRect();
+    const margin = 12;
+    const outOfView =
+      eRect.top < cRect.top + margin ||
+      eRect.bottom > cRect.bottom - margin ||
+      eRect.left < cRect.left + margin ||
+      eRect.right > cRect.right - margin;
+    if (outOfView) {
+      el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
+    }
+  }, [activeGenerationUri, activeApplyUri, scanCircles]);
+
+  useEffect(() => {
+    if (!generationJobId || !generationRunning) return;
+
+    const poll = async () => {
+      try {
+        const data = await pollAltGenerationEvents(generationJobId, lastGenSeqRef.current);
+        if (typeof data.processed_items === "number") {
+          setGenerationProcessed(data.processed_items);
+        }
+        if (typeof data.total_items === "number") {
+          setGenerationTotal(data.total_items);
+        }
+        if (data.events.length > 0) {
+          for (const event of data.events) {
+            lastGenSeqRef.current = Math.max(lastGenSeqRef.current, event.seq);
+            handleGenerationEvent(event);
+          }
+        }
+        if (data.done) {
+          setGenerationRunning(false);
+          setGenerationStopping(false);
+          if (pollTimerRef.current) {
+            window.clearInterval(pollTimerRef.current);
+            pollTimerRef.current = null;
+          }
+        }
+      } catch (err: any) {
+        appendScanLog(`Generation polling error: ${err?.message || "unknown error"}`);
+        setGenerationRunning(false);
+        setGenerationStopping(false);
+        if (pollTimerRef.current) {
+          window.clearInterval(pollTimerRef.current);
+          pollTimerRef.current = null;
+        }
+      }
+    };
+
+    poll();
+    pollTimerRef.current = window.setInterval(poll, 700);
+    return () => {
+      if (pollTimerRef.current) {
+        window.clearInterval(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+  }, [generationJobId, generationRunning]);
+
+  useEffect(() => {
+    if (!applyJobId) return;
+
+    const poll = async () => {
+      try {
+        const state = await getApplyQueueState(applyJobId);
+        setApplyQueueState(state);
+        setApplyProcessed(state.processed_items);
+        setApplyTotal(state.total_items);
+        setActiveApplyUri(state.active_uri || null);
+
+        const nextItemStatus: Record<string, ApplyItemStatus> = {};
+        state.items.forEach((item) => {
+          const key = makeKey(item.uri, item.image_index);
+          const err = (item.error || "").toLowerCase();
+          if (
+            (item.status === "propagating") ||
+            (
+              item.status === "pending" &&
+            (err.includes("propagation") || err.includes("pds accepted"))
+            )
+          ) {
+            nextItemStatus[key] = "propagating";
+          } else {
+            nextItemStatus[key] = item.status as ApplyItemStatus;
+          }
+        });
+        setApplyItemStatus((prev) => ({ ...prev, ...nextItemStatus }));
+
+        const successKeys = new Set(
+          state.items
+            .filter((x) => x.status === "applied")
+            .map((x) => makeKey(x.uri, x.image_index))
+        );
+        const failedUris = new Set(
+          state.items.filter((x) => x.status === "failed").map((x) => x.uri)
+        );
+        const runningUris = new Set(
+          state.items.filter((x) => x.status === "running").map((x) => x.uri)
+        );
+        const pendingUris = new Set(
+          state.items.filter((x) => x.status === "pending").map((x) => x.uri)
+        );
+        const propagatingUris = new Set(
+          state.items.filter((x) => x.status === "propagating").map((x) => x.uri)
+        );
+
+        setResult((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            posts: prev.posts.map((post) => ({
+              ...post,
+              images: post.images.map((img) => {
+                const key = makeKey(post.uri, img.index);
+                const draft = altStateRef.current[key]?.draftAlt?.trim();
+                if (successKeys.has(key) && draft) {
+                  return { ...img, alt: draft };
+                }
+                return img;
+              })
+            }))
+          };
+        });
+
+        setScanCircles((prev) =>
+          prev.map((circle) => {
+            if (circle.status === "black") return circle;
+            if (failedUris.has(circle.uri)) return { ...circle, status: "darkgreen" };
+            if (runningUris.has(circle.uri)) return circle;
+            if (propagatingUris.has(circle.uri)) return { ...circle, status: "darkgreen" };
+            if (pendingUris.has(circle.uri)) return { ...circle, status: "darkgreen" };
+            const uriItems = state.items.filter((x) => x.uri === circle.uri);
+            if (uriItems.length > 0 && uriItems.every((x) => x.status === "applied")) {
+              return { ...circle, status: "green", missingPending: 0 };
+            }
+            return circle;
+          })
+        );
+
+        if (state.status === "completed") {
+          setApplying(false);
+          setActiveApplyUri(null);
+          if (applyPollTimerRef.current) {
+            window.clearInterval(applyPollTimerRef.current);
+            applyPollTimerRef.current = null;
+          }
+          const errMsgs = state.items
+            .filter((x) => x.status === "failed" && x.error)
+            .map((x) => x.error as string);
+          const uniqErr = Array.from(new Set(errMsgs)).slice(0, 3);
+          setApplyMessage(
+            `Applied alt text to ${state.success_items} image(s).` +
+              (state.failed_items > 0
+                ? ` ${state.failed_items} image(s) failed.` +
+                  (uniqErr.length > 0 ? ` Errors: ${uniqErr.join(" | ")}` : "")
+                : "")
+          );
+        } else if (state.status === "paused") {
+          setApplying(false);
+          if (state.pause_reason) {
+            setApplyMessage(
+              `Apply queue paused. ${state.pause_reason}` +
+                (state.rate_limit_reset_at
+                  ? ` Retry after ${new Date(state.rate_limit_reset_at * 1000).toLocaleString()}.`
+                  : "")
+            );
+          }
+        } else if (state.status === "running" && state.failed_items > 0) {
+          const firstErr = state.items.find((x) => x.status === "failed" && x.error)?.error;
+          setApplyMessage(
+            `Apply queue running: ${state.success_items} applied, ${state.failed_items} failed so far.` +
+              (firstErr ? ` Latest error: ${firstErr}` : "")
+          );
+        }
+      } catch (err: any) {
+        appendScanLog(`Apply queue polling error: ${err?.message || "unknown error"}`);
+        if (applyPollTimerRef.current) {
+          window.clearInterval(applyPollTimerRef.current);
+          applyPollTimerRef.current = null;
+        }
+      }
+    };
+
+    poll();
+    applyPollTimerRef.current = window.setInterval(poll, 1000);
+    return () => {
+      if (applyPollTimerRef.current) {
+        window.clearInterval(applyPollTimerRef.current);
+        applyPollTimerRef.current = null;
+      }
+    };
+  }, [applyJobId]);
+
+  const appendScanLog = (line: string) => {
+    const timestamp = new Date().toLocaleTimeString();
+    setScanLogLines((prev) => [...prev.slice(-399), `[${timestamp}] ${line}`]);
+  };
+
+  const resetGenerationState = () => {
+    setGenerationJobId(null);
+    setGenerationRunning(false);
+    setGenerationStopping(false);
+    setGenerationProcessed(0);
+    setGenerationTotal(0);
+    setImageGenStatus({});
+    setImageGenError({});
+    setRegeneratingKeyMap({});
+    setScanCircles([]);
+    setActiveGenerationUri(null);
+    setActiveApplyUri(null);
+    setApplyProcessed(0);
+    setApplyTotal(0);
+    setApplyJobId(null);
+    setApplyQueueState(null);
+    setApplyItemStatus({});
+    lastGenSeqRef.current = 0;
+    if (pollTimerRef.current) {
+      window.clearInterval(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    if (applyPollTimerRef.current) {
+      window.clearInterval(applyPollTimerRef.current);
+      applyPollTimerRef.current = null;
+    }
+  };
+
+  const applyGeneratedAlt = (uri: string, index: number, generatedAlt: string) => {
+    setResult((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        posts: prev.posts.map((post) => {
+          if (post.uri !== uri) return post;
+          return {
+            ...post,
+            images: post.images.map((img) =>
+              img.index === index ? { ...img, generated_alt: generatedAlt } : img
+            )
+          };
+        })
+      };
+    });
+
+    const key = makeKey(uri, index);
+    setAltState((prev) => {
+      const current = prev[key];
+      if (!current) return prev;
+      if (current.userEdited) return prev;
+      if (current.draftAlt && current.draftAlt.trim().length > 0) return prev;
+      return {
+        ...prev,
+        [key]: { ...current, draftAlt: generatedAlt }
+      };
+    });
+  };
+
+  const handleGenerationEvent = (event: GenerateJobEvent) => {
+    if (event.type === "started" && event.message) {
+      appendScanLog(event.message);
+    }
+    if (event.type === "item_started" && event.uri && typeof event.image_index === "number") {
+      const key = makeKey(event.uri, event.image_index);
+      setImageGenStatus((prev) => ({ ...prev, [key]: "generating" }));
+      setActiveGenerationUri(event.uri);
+    }
+    if (event.type === "item_result" && event.uri && typeof event.image_index === "number") {
+      const key = makeKey(event.uri, event.image_index);
+      if (event.error) {
+        setImageGenStatus((prev) => ({ ...prev, [key]: "error" }));
+        setImageGenError((prev) => ({ ...prev, [key]: event.error || "Generation failed." }));
+      } else {
+        setImageGenStatus((prev) => ({ ...prev, [key]: "done" }));
+        if (event.generated_alt && event.generated_alt.trim().length > 0) {
+          applyGeneratedAlt(event.uri, event.image_index, event.generated_alt);
+          setScanCircles((prev) =>
+            prev.map((circle) => {
+              if (circle.uri !== event.uri) return circle;
+              const nextPending = Math.max(0, circle.missingPending - 1);
+              return {
+                ...circle,
+                missingPending: nextPending,
+                status: nextPending === 0 ? "darkgreen" : circle.status
+              };
+            })
+          );
+        }
+      }
+    }
+    if (event.type === "stop_requested" && event.message) {
+      appendScanLog(event.message);
+    }
+    if (event.type === "complete") {
+      const stopped = !!event.stop_requested;
+      appendScanLog(
+        stopped
+          ? `Generation stopped. Completed ${event.processed_items ?? 0}/${event.total_items ?? 0}.`
+          : `Generation complete. Completed ${event.processed_items ?? 0}/${event.total_items ?? 0}.`
+      );
+      setGenerationRunning(false);
+      setGenerationStopping(false);
+      setActiveGenerationUri(null);
+    }
+  };
 
   const initAltStateFromResult = (data: ScanResponse) => {
     const next: AltStateMap = {};
+    const nextApplyStatus: Record<string, ApplyItemStatus> = {};
     data.posts.forEach((post) => {
       post.images.forEach((img) => {
         const key = makeKey(post.uri, img.index);
@@ -52,11 +430,20 @@ const App: React.FC = () => {
           img.alt && img.alt.trim().length > 0 ? img.alt : img.generated_alt || "";
         next[key] = {
           apply: !img.alt || img.alt.trim().length === 0, // default: auto-select only images with no existing alt
-          draftAlt: baseAlt
+          draftAlt: baseAlt,
+          userEdited: false
         };
+        if (img.apply_status === "applied") {
+          nextApplyStatus[key] = "applied";
+        } else if (img.apply_status === "failed") {
+          nextApplyStatus[key] = "failed";
+        } else {
+          nextApplyStatus[key] = "idle";
+        }
       });
     });
     setAltState(next);
+    setApplyItemStatus(nextApplyStatus);
   };
 
   const onSubmit = async (e: React.FormEvent) => {
@@ -65,6 +452,9 @@ const App: React.FC = () => {
     setApplyMessage(null);
     setResult(null);
     setAltState({});
+    setScanLogLines([]);
+    setScanStats({ postsScanned: 0, imagesFound: 0 });
+    resetGenerationState();
 
     if (!handle || !appPassword) {
       setError("Please enter both handle and app password.");
@@ -73,13 +463,91 @@ const App: React.FC = () => {
 
     setLoading(true);
     try {
-      const data = await scanImages({
-        handle,
-        app_password: appPassword,
-        generate_alt: true
-      });
+      appendScanLog("Starting scan...");
+      const data = await scanImagesWithProgress(
+        {
+          handle,
+          app_password: appPassword,
+          generate_alt: false
+        },
+        (event: ScanProgressEvent) => {
+          if (event.event === "post_scanned" && event.post_uri && event.post_state) {
+            const nextStatus: CircleStatus =
+              event.post_state === "no_images"
+                ? "black"
+                : event.post_state === "images_missing_alt"
+                  ? "red"
+                  : event.post_state === "images_generated_not_applied"
+                    ? "darkgreen"
+                  : "green";
+            const missingPending = event.missing_images_needing_generation ?? 0;
+            setScanCircles((prev) => {
+              const idx = prev.findIndex((c) => c.uri === event.post_uri);
+              if (idx === -1) {
+                return [
+                  ...prev,
+                  { uri: event.post_uri as string, status: nextStatus, missingPending }
+                ];
+              }
+              const next = [...prev];
+              next[idx] = { ...next[idx], status: nextStatus, missingPending };
+              return next;
+            });
+          }
+          if (event.type === "progress" && event.message) {
+            appendScanLog(event.message);
+            if (
+              typeof event.posts_scanned === "number" ||
+              typeof event.images_found === "number"
+            ) {
+              setScanStats((prev) => ({
+                postsScanned: event.posts_scanned ?? prev.postsScanned,
+                imagesFound: event.images_found ?? prev.imagesFound
+              }));
+            }
+          }
+        }
+      );
+      appendScanLog(
+        `Scan complete: ${data.total_posts} posts with images, ${data.total_images} images found.`
+      );
       setResult(data);
       initAltStateFromResult(data);
+
+      const generationItems = data.posts.flatMap((post) =>
+        post.images
+          .filter(
+            (img) =>
+              (!img.alt || img.alt.trim().length === 0) &&
+              (!img.generated_alt || img.generated_alt.trim().length === 0)
+          )
+          .map((img) => ({
+            uri: post.uri,
+            image_index: img.index,
+            fullsize_url: img.fullsize_url,
+            post_text: post.text || "",
+            current_alt: img.alt
+          }))
+      );
+
+      if (!data.alt_generation_enabled) {
+        appendScanLog("OpenAI alt generation disabled (missing OPENAI_API_KEY).");
+      } else if (generationItems.length === 0) {
+        appendScanLog("No missing-alt images found. Nothing to generate.");
+      } else {
+        setGenerationTotal(generationItems.length);
+        setGenerationProcessed(0);
+        const queued: Record<string, GenStatus> = {};
+        generationItems.forEach((item) => {
+          queued[makeKey(item.uri, item.image_index)] = "queued";
+        });
+        setImageGenStatus(queued);
+        appendScanLog(`Starting OpenAI generation for ${generationItems.length} images...`);
+
+        const started = await startAltGeneration(handle, generationItems);
+        setGenerationJobId(started.job_id);
+        setGenerationRunning(true);
+      }
     } catch (err: any) {
       console.error(err);
       let msg = "An error occurred while scanning.";
@@ -95,8 +563,74 @@ const App: React.FC = () => {
         if (err.message) msg = err.message;
       }
       setError(msg);
+      appendScanLog(`Scan failed: ${msg}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const onStopGeneration = async () => {
+    if (!generationJobId || !generationRunning || generationStopping) return;
+    setGenerationStopping(true);
+    appendScanLog("Requesting generation stop...");
+    try {
+      await stopAltGeneration(generationJobId);
+    } catch (err: any) {
+      setGenerationStopping(false);
+      appendScanLog(`Failed to stop generation: ${err?.message || "unknown error"}`);
+    }
+  };
+
+  const onRegenerateAlt = async (post: PostInfo, img: ImageInfo) => {
+    const key = makeKey(post.uri, img.index);
+    setRegeneratingKeyMap((prev) => ({ ...prev, [key]: true }));
+    setImageGenStatus((prev) => ({ ...prev, [key]: "generating" }));
+    setActiveGenerationUri(post.uri);
+    setImageGenError((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+    appendScanLog(`Regenerating alt text for ${post.uri} image #${img.index}...`);
+
+    try {
+      const resp = await regenerateAltText(handle, {
+        uri: post.uri,
+        image_index: img.index,
+        fullsize_url: img.fullsize_url,
+        post_text: post.text || "",
+        current_alt: img.alt
+      });
+
+      if (resp.generated_alt && resp.generated_alt.trim().length > 0) {
+        applyGeneratedAlt(post.uri, img.index, resp.generated_alt.trim());
+        setImageGenStatus((prev) => ({ ...prev, [key]: "done" }));
+        setScanCircles((prev) =>
+          prev.map((circle) => {
+            if (circle.uri !== post.uri) return circle;
+            const nextPending = Math.max(0, circle.missingPending - 1);
+            return {
+              ...circle,
+              missingPending: nextPending,
+              status: nextPending === 0 ? "darkgreen" : circle.status
+            };
+          })
+        );
+        appendScanLog(`Regenerated alt text for ${post.uri} image #${img.index}.`);
+      } else {
+        const err = resp.error || "No text returned.";
+        setImageGenStatus((prev) => ({ ...prev, [key]: "error" }));
+        setImageGenError((prev) => ({ ...prev, [key]: err }));
+        appendScanLog(`Regenerate failed for ${post.uri} image #${img.index}: ${err}`);
+      }
+    } catch (err: any) {
+      const msg = err?.message || "Unknown error";
+      setImageGenStatus((prev) => ({ ...prev, [key]: "error" }));
+      setImageGenError((prev) => ({ ...prev, [key]: msg }));
+      appendScanLog(`Regenerate failed for ${post.uri} image #${img.index}: ${msg}`);
+    } finally {
+      setRegeneratingKeyMap((prev) => ({ ...prev, [key]: false }));
+      setActiveGenerationUri((prev) => (prev === post.uri ? null : prev));
     }
   };
 
@@ -106,7 +640,8 @@ const App: React.FC = () => {
       ...prev,
       [key]: {
         apply: prev[key]?.apply ?? false,
-        draftAlt: value
+        draftAlt: value,
+        userEdited: true
       }
     }));
   };
@@ -117,7 +652,8 @@ const App: React.FC = () => {
       ...prev,
       [key]: {
         apply,
-        draftAlt: prev[key]?.draftAlt ?? ""
+        draftAlt: prev[key]?.draftAlt ?? "",
+        userEdited: prev[key]?.userEdited ?? false
       }
     }));
   };
@@ -150,35 +686,20 @@ const App: React.FC = () => {
     }
 
     setApplying(true);
+    setApplyTotal(updates.length);
+    setApplyProcessed(0);
     try {
-      const resp: ApplyResponse = await applyAltUpdates(handle, appPassword, updates);
-      const successes = resp.updated.filter((r) => r.success).length;
-      const failures = resp.updated.length - successes;
-
+      const started = await startApplyQueue(handle, appPassword, updates);
+      setApplyJobId(started.job_id);
       setApplyMessage(
-        `Applied alt text to ${successes} post(s).` +
-          (failures > 0 ? ` ${failures} post(s) failed; check logs/errors.` : "")
+        `Apply queue started for ${started.total_items} image(s). Running with rate-limit-aware pacing.`
       );
-
-      // Optimistically update result alt fields for the UI
-      const nextResult: ScanResponse = {
-        ...result,
-        posts: result.posts.map((post) => ({
-          ...post,
-          images: post.images.map((img) => {
-            const key = makeKey(post.uri, img.index);
-            const state = altState[key];
-            if (state?.apply && state.draftAlt.trim()) {
-              return {
-                ...img,
-                alt: state.draftAlt.trim()
-              };
-            }
-            return img;
-          })
-        }))
-      };
-      setResult(nextResult);
+      const nextStatuses: Record<string, ApplyItemStatus> = {};
+      updates.forEach((u) => {
+        nextStatuses[makeKey(u.uri, u.image_index)] = "pending";
+      });
+      setApplyItemStatus((prev) => ({ ...prev, ...nextStatuses }));
+      appendScanLog(`Apply queue started: ${started.job_id}`);
     } catch (err: any) {
       console.error(err);
       let msg = "An error occurred while applying changes.";
@@ -194,8 +715,30 @@ const App: React.FC = () => {
         if (err.message) msg = err.message;
       }
       setError(msg);
-    } finally {
       setApplying(false);
+    } finally {
+      setActiveApplyUri(null);
+    }
+  };
+
+  const onPauseApplyQueue = async () => {
+    if (!applyJobId) return;
+    try {
+      await pauseApplyQueue(applyJobId);
+      setApplyMessage("Apply queue paused.");
+    } catch (err: any) {
+      setError(err?.message || "Failed to pause apply queue.");
+    }
+  };
+
+  const onResumeApplyQueue = async () => {
+    if (!applyJobId) return;
+    try {
+      await resumeApplyQueue(applyJobId, handle, appPassword);
+      setApplying(true);
+      setApplyMessage("Apply queue resumed.");
+    } catch (err: any) {
+      setError(err?.message || "Failed to resume apply queue.");
     }
   };
 
@@ -213,7 +756,8 @@ const App: React.FC = () => {
               draftAlt:
                 img.alt && img.alt.trim().length > 0
                   ? img.alt
-                  : img.generated_alt || ""
+                  : img.generated_alt || "",
+              userEdited: false
             };
             next[key] = {
               ...existing,
@@ -255,13 +799,87 @@ const App: React.FC = () => {
     }
   };
 
+  const getApplyStatusLabel = (status: ApplyItemStatus): string => {
+    switch (status) {
+      case "pending":
+        return applyQueueState?.status === "paused" ? "queued (paused)" : "queued";
+      case "propagating":
+        return "propagating to Bluesky";
+      case "running":
+        return "applying now";
+      case "applied":
+        return "applied";
+      case "failed":
+        return "failed";
+      case "idle":
+      default:
+        return "not queued";
+    }
+  };
+
+  const getPostQueueSummary = (uri: string): string => {
+    if (!applyQueueState) return "Queue: none";
+    const rows = applyQueueState.items.filter((x) => x.uri === uri);
+    if (rows.length === 0) return "Queue: none";
+    const propagating = rows.filter(
+      (x) =>
+        (x.status === "propagating") ||
+        (
+          x.status === "pending" &&
+        ((x.error || "").toLowerCase().includes("propagation") ||
+          (x.error || "").toLowerCase().includes("pds accepted"))
+        )
+    ).length;
+    const running = rows.filter((x) => x.status === "running").length;
+    const pending = rows.filter((x) => x.status === "pending").length - propagating;
+    const failed = rows.filter((x) => x.status === "failed").length;
+    const applied = rows.filter((x) => x.status === "applied").length;
+    return `Queue ${applyQueueState.status}: running ${running}, propagating ${propagating}, pending ${Math.max(0, pending)}, applied ${applied}, failed ${failed}`;
+  };
+
+  const isPostGenerating = (uri: string): boolean => {
+    const prefix = `${uri}::`;
+    return Object.entries(imageGenStatus).some(
+      ([key, status]) => key.startsWith(prefix) && status === "generating"
+    );
+  };
+
+  const isPostActive = (uri: string): boolean => {
+    if (activeApplyUri === uri) return true;
+    return isPostGenerating(uri);
+  };
+
+  const getPostQueueClass = (uri: string): string => {
+    if (!applyQueueState) return "";
+    const rows = applyQueueState.items.filter((x) => x.uri === uri);
+    if (rows.length === 0) return "";
+    if (rows.some((x) => x.status === "running")) return "queue-running";
+    if (
+      rows.some(
+        (x) =>
+          x.status === "propagating" ||
+          (
+            x.status === "pending" &&
+          ((x.error || "").toLowerCase().includes("propagation") ||
+            (x.error || "").toLowerCase().includes("pds accepted"))
+          )
+      )
+    ) {
+      return "queue-propagating";
+    }
+    if (rows.some((x) => x.status === "pending")) {
+      return applyQueueState.status === "paused" ? "queue-paused" : "queue-pending";
+    }
+    return "";
+  };
+
   return (
     <div className="app-root">
       <div className="texture-overlay" />
       <header className="app-header">
-        <h1>Bluesky Alt-Text Slinger</h1>
+        <h1>Alt Text Slinger</h1>
         <p className="subtitle">
-          Phase 4: Scan, review suggestions, apply updates, with filters and SQLite persistence.
+          Scan posts, generate alt text, and apply updates with live visual progress.
         </p>
       </header>
 
@@ -293,11 +911,86 @@ const App: React.FC = () => {
             </label>
 
             <button type="submit" className="primary-btn" disabled={loading}>
-              {loading ? "Scanning..." : "Scan My Posts"}
+              {loading
+                ? `Scanning... (${scanStats.postsScanned} posts, ${scanStats.imagesFound} images)`
+                : "Scan My Posts"}
             </button>
 
             {error && <div className="error-banner">{error}</div>}
           </form>
+
+          {(loading || scanCircles.length > 0) && (
+            <div className="scan-progress-panel">
+              <div className="scan-progress-header">
+                <strong>Scan/generation map</strong>
+                <span>
+                  Posts scanned: {scanStats.postsScanned} · Images found: {scanStats.imagesFound}
+                  {generationTotal > 0
+                    ? ` · Generated: ${generationProcessed}/${generationTotal}`
+                    : ""}
+                  {applyTotal > 0 ? ` · Applied: ${applyProcessed}/${applyTotal}` : ""}
+                </span>
+                {generationRunning && (
+                  <button
+                    type="button"
+                    className="stop-btn"
+                    onClick={onStopGeneration}
+                    disabled={generationStopping}
+                  >
+                    {generationStopping ? "Stopping..." : "Stop Generation"}
+                  </button>
+                )}
+              </div>
+              <div className="scan-dot-legend">
+                <span><i className="scan-dot black" /> No images</span>
+                <span><i className="scan-dot red" /> Images missing alt</span>
+                <span><i className="scan-dot darkgreen" /> Generated (not applied)</span>
+                <span><i className="scan-dot green" /> Applied/ready</span>
+                <span><i className="scan-dot queue-propagating" /> Propagating</span>
+                <span><i className="scan-dot queue-pending" /> In apply queue</span>
+                <span><i className="scan-dot queue-paused" /> Queue paused</span>
+              </div>
+              <div className="scan-dot-grid" ref={scanMapRef}>
+                {scanCircles.length === 0 ? (
+                  <div className="scan-log-line">Preparing scan...</div>
+                ) : (
+                  scanCircles.map((circle, idx) => (
+                    (() => {
+                      const active = isPostActive(circle.uri);
+                      const statusLabel =
+                        circle.status === "black"
+                          ? "No images"
+                          : circle.status === "red"
+                            ? "Images missing alt"
+                            : circle.status === "darkgreen"
+                              ? "Generated locally (not fully applied)"
+                              : "Applied/ready";
+                      const pendingLabel =
+                        circle.missingPending > 0
+                          ? `Missing images pending generation: ${circle.missingPending}`
+                          : "Missing images pending generation: 0";
+                      const queueLabel = getPostQueueSummary(circle.uri);
+                      const tooltip = `${statusLabel}\n${pendingLabel}\n${queueLabel}\n${circle.uri}`;
+                      return (
+                        <a
+                          key={`${circle.uri}-${idx}`}
+                          href={atUriToBskyWebUrl(circle.uri, result?.handle || handle)}
+                          target="_blank"
+                          rel="noreferrer"
+                          ref={(el) => {
+                            dotRefs.current[circle.uri] = el;
+                          }}
+                          className={`scan-dot ${circle.status} ${active ? "active" : ""} ${getPostQueueClass(circle.uri)}`}
+                          title={tooltip}
+                          aria-label={tooltip}
+                        />
+                      );
+                    })()
+                  ))
+                )}
+              </div>
+            </div>
+          )}
         </section>
 
         {result && (
@@ -326,15 +1019,38 @@ const App: React.FC = () => {
                 <button
                   type="button"
                   className="primary-btn"
-                  disabled={applying}
+                  disabled={applying && applyQueueState?.status === "running"}
                   onClick={onApplyChanges}
                 >
-                  {applying ? "Applying..." : "Apply Selected Alt Text"}
+                  {applying ? "Queue Running..." : "Apply Selected Alt Text"}
                 </button>
+                {applyJobId && applyQueueState?.status === "running" && (
+                  <button type="button" className="filter-btn" onClick={onPauseApplyQueue}>
+                    Pause Queue
+                  </button>
+                )}
+                {applyJobId && applyQueueState?.status === "paused" && (
+                  <button type="button" className="filter-btn" onClick={onResumeApplyQueue}>
+                    Resume Queue
+                  </button>
+                )}
                 <span className="apply-hint">
-                  Only images with the checkbox enabled and non-empty alt text will be updated.
+                  Only checked images with non-empty alt text are queued.
                 </span>
               </div>
+              {applyQueueState && (
+                <p className="apply-hint">
+                  Queue: <strong>{applyQueueState.status}</strong> · Done{" "}
+                  {applyQueueState.processed_items}/{applyQueueState.total_items} · Success{" "}
+                  {applyQueueState.success_items} · Failed {applyQueueState.failed_items} · Propagating{" "}
+                  {applyQueueState.propagating_items} · Pending{" "}
+                  {applyQueueState.pending_items} · Running {applyQueueState.running_items}
+                  {applyQueueState.pause_reason ? ` · ${applyQueueState.pause_reason}` : ""}
+                  {applyQueueState.rate_limit_reset_at
+                    ? ` · reset ${new Date(applyQueueState.rate_limit_reset_at * 1000).toLocaleString()}`
+                    : ""}
+                </p>
+              )}
 
               <div className="filter-controls">
                 <span className="filter-label">Filter:</span>
@@ -406,8 +1122,16 @@ const App: React.FC = () => {
                         draftAlt:
                           img.alt && img.alt.trim().length > 0
                             ? img.alt
-                            : img.generated_alt || ""
+                            : img.generated_alt || "",
+                        userEdited: false
                       };
+                      const genStatus = imageGenStatus[key];
+                      const genErr = imageGenError[key];
+                      const itemApplyStatus = applyItemStatus[key] || "idle";
+                      const itemApplyError =
+                        applyQueueState?.items.find(
+                          (x) => x.uri === post.uri && x.image_index === img.index
+                        )?.error || "";
 
                       return (
                         <article key={`${post.uri}-${img.index}`} className="image-card">
@@ -451,12 +1175,44 @@ const App: React.FC = () => {
                               <span className="meta-value meta-alt suggested-alt">
                                 {img.generated_alt && img.generated_alt.trim().length > 0 ? (
                                   img.generated_alt
+                                ) : genStatus === "generating" || genStatus === "queued" ? (
+                                  <em>(generating...)</em>
+                                ) : genStatus === "error" ? (
+                                  <em>(generation error: {genErr || "unknown"})</em>
                                 ) : result.alt_generation_enabled ? (
                                   <em>(no suggestion returned)</em>
                                 ) : (
                                   <em>(configure OPENAI_API_KEY to enable suggestions)</em>
                                 )}
                               </span>
+                            </div>
+
+                            <div className="meta-row">
+                              <span className="meta-label">Generation status</span>
+                              <span className="meta-value">
+                                {genStatus ? genStatus : <em>not queued</em>}
+                              </span>
+                            </div>
+
+                            <div className="meta-row">
+                              <span className="meta-label">Apply queue status</span>
+                              <span className={`meta-value apply-status apply-${itemApplyStatus}`}>
+                                {getApplyStatusLabel(itemApplyStatus)}
+                                {itemApplyError ? ` · ${itemApplyError}` : ""}
+                              </span>
+                            </div>
+
+                            <div className="meta-row">
+                              <button
+                                type="button"
+                                className="regen-btn"
+                                onClick={() => onRegenerateAlt(post, img)}
+                                disabled={!!regeneratingKeyMap[key]}
+                              >
+                                {regeneratingKeyMap[key]
+                                  ? "Regenerating..."
+                                  : "Regenerate alt-text"}
+                              </button>
                             </div>
 
                             <div className="meta-row">
@@ -492,12 +1248,12 @@ const App: React.FC = () => {
 
                             <div className="meta-row link-row">
                               <a
-                                href={post.uri}
+                                href={atUriToBskyWebUrl(post.uri, result.handle)}
                                 target="_blank"
                                 rel="noreferrer"
                                 className="post-link"
                               >
-                                View post (URI)
+                                View post
                               </a>
                               <a
                                 href={img.fullsize_url}
@@ -521,8 +1277,7 @@ const App: React.FC = () => {
 
       <footer className="app-footer">
         <span>
-          Phase 4 – changes you apply here update alt text on your Bluesky posts and are tracked
-          in SQLite.
+          Changes are persisted locally and only marked applied after verification.
         </span>
       </footer>
     </div>

@@ -16,7 +16,7 @@ import {
   pollAltGenerationEvents,
   stopAltGeneration,
   GenerateJobEvent,
-  regenerateAltText
+  regenerateAltText, discoverModels, ProviderModels, GenerationConfig
 } from "./api";
 
 function formatDate(dateStr?: string | null): string {
@@ -68,6 +68,34 @@ type ScanCircle = {
 };
 
 const App: React.FC = () => {
+  const [llmKey, setLlmKey] = useState("");
+  const [providerChoice, setProviderChoice] = useState("auto");
+  const [catalog, setCatalog] = useState<ProviderModels | null>(null);
+  const [model, setModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [providerError, setProviderError] = useState("");
+  const providerRequest = useRef(0);
+  const generationConfig: GenerationConfig | undefined = catalog && model && llmKey.trim()
+    ? {api_key: llmKey.trim(), provider: catalog.provider, model} : undefined;
+  const invalidateProvider = () => {
+    providerRequest.current += 1;
+    setCatalog(null); setModel(""); setProviderError(""); setModelsLoading(false);
+  };
+  const loadModels = async () => {
+    const request = ++providerRequest.current;
+    setModelsLoading(true); setProviderError(""); setCatalog(null); setModel("");
+    try {
+      const data = await discoverModels(llmKey.trim(), providerChoice);
+      if (providerRequest.current !== request) return;
+      setCatalog(data);
+      setModel(data.models[0]?.id || "");
+      if (!data.models.length) setProviderError("No supported image-description models were returned for this provider.");
+    } catch (err) {
+      if (providerRequest.current === request) setProviderError(err instanceof Error ? err.message : "Unable to load models.");
+    } finally {
+      if (providerRequest.current === request) setModelsLoading(false);
+    }
+  };
   const [handle, setHandle] = useState("");
   const [appPassword, setAppPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -95,6 +123,7 @@ const App: React.FC = () => {
   const [applyItemStatus, setApplyItemStatus] = useState<Record<string, ApplyItemStatus>>({});
   const [imageGenStatus, setImageGenStatus] = useState<Record<string, GenStatus>>({});
   const [imageGenError, setImageGenError] = useState<Record<string, string>>({});
+  const regenerationInFlight = useRef(false);
   const [regeneratingKeyMap, setRegeneratingKeyMap] = useState<Record<string, boolean>>({});
   const [activeGenerationUri, setActiveGenerationUri] = useState<string | null>(null);
   const [activeApplyUri, setActiveApplyUri] = useState<string | null>(null);
@@ -135,10 +164,14 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!generationJobId || !generationRunning) return;
-
+    let inFlight = false;
+    let cancelled = false;
     const poll = async () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
       try {
         const data = await pollAltGenerationEvents(generationJobId, lastGenSeqRef.current);
+        if (cancelled) return;
         if (typeof data.processed_items === "number") {
           setGenerationProcessed(data.processed_items);
         }
@@ -147,7 +180,8 @@ const App: React.FC = () => {
         }
         if (data.events.length > 0) {
           for (const event of data.events) {
-            lastGenSeqRef.current = Math.max(lastGenSeqRef.current, event.seq);
+            if (event.seq <= lastGenSeqRef.current) continue;
+            lastGenSeqRef.current = event.seq;
             handleGenerationEvent(event);
           }
         }
@@ -161,18 +195,16 @@ const App: React.FC = () => {
         }
       } catch (err: any) {
         appendScanLog(`Generation polling error: ${err?.message || "unknown error"}`);
-        setGenerationRunning(false);
-        setGenerationStopping(false);
-        if (pollTimerRef.current) {
-          window.clearInterval(pollTimerRef.current);
-          pollTimerRef.current = null;
-        }
+        // Keep the batch active and retry; a failed poll does not stop the worker.
+      } finally {
+        inFlight = false;
       }
     };
 
     poll();
     pollTimerRef.current = window.setInterval(poll, 700);
     return () => {
+      cancelled = true;
       if (pollTimerRef.current) {
         window.clearInterval(pollTimerRef.current);
         pollTimerRef.current = null;
@@ -182,11 +214,17 @@ const App: React.FC = () => {
 
   useEffect(() => {
     if (!applyJobId) return;
+    let inFlight = false;
+    let cancelled = false;
 
     const poll = async () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
       try {
         const state = await getApplyQueueState(applyJobId);
+        if (cancelled) return;
         setApplyQueueState(state);
+        setApplying(state.status === "running");
         setApplyProcessed(state.processed_items);
         setApplyTotal(state.total_items);
         setActiveApplyUri(state.active_uri || null);
@@ -297,16 +335,16 @@ const App: React.FC = () => {
         }
       } catch (err: any) {
         appendScanLog(`Apply queue polling error: ${err?.message || "unknown error"}`);
-        if (applyPollTimerRef.current) {
-          window.clearInterval(applyPollTimerRef.current);
-          applyPollTimerRef.current = null;
-        }
+        // Keep polling: a transient network failure must not freeze progress.
+      } finally {
+        inFlight = false;
       }
     };
 
     poll();
     applyPollTimerRef.current = window.setInterval(poll, 1000);
     return () => {
+      cancelled = true;
       if (applyPollTimerRef.current) {
         window.clearInterval(applyPollTimerRef.current);
         applyPollTimerRef.current = null;
@@ -347,7 +385,7 @@ const App: React.FC = () => {
     }
   };
 
-  const applyGeneratedAlt = (uri: string, index: number, generatedAlt: string) => {
+  const applyGeneratedAlt = (uri: string, index: number, generatedAlt: string, replaceSuggestion = false) => {
     setResult((prev) => {
       if (!prev) return prev;
       return {
@@ -369,7 +407,7 @@ const App: React.FC = () => {
       const current = prev[key];
       if (!current) return prev;
       if (current.userEdited) return prev;
-      if (current.draftAlt && current.draftAlt.trim().length > 0) return prev;
+      if (!replaceSuggestion && current.draftAlt && current.draftAlt.trim().length > 0) return prev;
       return {
         ...prev,
         [key]: { ...current, draftAlt: generatedAlt }
@@ -453,6 +491,7 @@ const App: React.FC = () => {
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (generationRunning || generationStopping || regenerationInFlight.current || loading) return;
     setError(null);
     setApplyMessage(null);
     setResult(null);
@@ -466,6 +505,10 @@ const App: React.FC = () => {
       return;
     }
 
+    if (llmKey.trim() && !generationConfig) {
+      setError("Load models and choose a model before scanning, or clear the LLM key to scan without it.");
+      return;
+    }
     setLoading(true);
     try {
       appendScanLog("Starting scan...");
@@ -535,8 +578,8 @@ const App: React.FC = () => {
           }))
       );
 
-      if (!data.alt_generation_enabled) {
-        appendScanLog("OpenAI alt generation disabled (missing OPENAI_API_KEY).");
+      if (!data.alt_generation_enabled && !generationConfig) {
+        appendScanLog("Alt generation disabled. Add an LLM key above to enable it.");
       } else if (generationItems.length === 0) {
         appendScanLog("No missing-alt images found. Nothing to generate.");
       } else {
@@ -547,9 +590,9 @@ const App: React.FC = () => {
           queued[makeKey(item.uri, item.image_index)] = "queued";
         });
         setImageGenStatus(queued);
-        appendScanLog(`Starting OpenAI generation for ${generationItems.length} images...`);
+        appendScanLog(`Starting alt-text generation for ${generationItems.length} images...`);
 
-        const started = await startAltGeneration(handle, generationItems);
+        const started = await startAltGeneration(handle, generationItems, generationConfig);
         setGenerationJobId(started.job_id);
         setGenerationRunning(true);
       }
@@ -587,7 +630,13 @@ const App: React.FC = () => {
   };
 
   const onRegenerateAlt = async (post: PostInfo, img: ImageInfo) => {
+    if (generationRunning || generationStopping || loading || regenerationInFlight.current) return;
+    if (llmKey.trim() && !generationConfig) {
+      setProviderError("Load models and choose a model before regenerating.");
+      return;
+    }
     const key = makeKey(post.uri, img.index);
+    regenerationInFlight.current = true;
     setRegeneratingKeyMap((prev) => ({ ...prev, [key]: true }));
     setImageGenStatus((prev) => ({ ...prev, [key]: "generating" }));
     setActiveGenerationUri(post.uri);
@@ -605,10 +654,10 @@ const App: React.FC = () => {
         fullsize_url: img.fullsize_url,
         post_text: post.text || "",
         current_alt: img.alt
-      });
+      }, generationConfig);
 
       if (resp.generated_alt && resp.generated_alt.trim().length > 0) {
-        applyGeneratedAlt(post.uri, img.index, resp.generated_alt.trim());
+        applyGeneratedAlt(post.uri, img.index, resp.generated_alt.trim(), true);
         setImageGenStatus((prev) => ({ ...prev, [key]: "done" }));
         setScanCircles((prev) =>
           prev.map((circle) => {
@@ -634,6 +683,7 @@ const App: React.FC = () => {
       setImageGenError((prev) => ({ ...prev, [key]: msg }));
       appendScanLog(`Regenerate failed for ${post.uri} image #${img.index}: ${msg}`);
     } finally {
+      regenerationInFlight.current = false;
       setRegeneratingKeyMap((prev) => ({ ...prev, [key]: false }));
       setActiveGenerationUri((prev) => (prev === post.uri ? null : prev));
     }
@@ -754,7 +804,7 @@ const App: React.FC = () => {
       result.posts.forEach((post) => {
         post.images.forEach((img) => {
           const key = makeKey(post.uri, img.index);
-          const hasAlt = img.alt && img.alt.trim().length > 0;
+          const hasAlt = !!img.alt && img.alt.trim().length > 0;
           if (!hasAlt) {
             const existing = next[key] ?? {
               apply: false,
@@ -788,7 +838,7 @@ const App: React.FC = () => {
   const shouldShowImage = (post: PostInfo, img: ImageInfo): boolean => {
     const key = makeKey(post.uri, img.index);
     const state = altState[key];
-    const hasAlt = img.alt && img.alt.trim().length > 0;
+    const hasAlt = !!img.alt && img.alt.trim().length > 0;
     const isSelected = !!state?.apply;
 
     switch (filterMode) {
@@ -894,6 +944,7 @@ const App: React.FC = () => {
           <p className="card-help">
             Use your Bluesky handle and an <strong>app password</strong>, not your main password.
           </p>
+          <p className="key-privacy-note">Your app password stays in memory and is sent via the local backend only to Bluesky. It is never saved to disk or browser storage.</p>
           <form onSubmit={onSubmit} className="login-form">
             <label className="input-group">
               <span>Handle</span>
@@ -909,13 +960,14 @@ const App: React.FC = () => {
               <span>App Password</span>
               <input
                 type="password"
+                autoComplete="off"
                 placeholder="xxxx-xxxx-xxxx-xxxx"
                 value={appPassword}
                 onChange={(e) => setAppPassword(e.target.value)}
               />
             </label>
 
-            <button type="submit" className="primary-btn" disabled={loading}>
+            <button type="submit" className="primary-btn" disabled={loading || generationRunning || Object.values(regeneratingKeyMap).some(Boolean)}>
               {loading
                 ? `Scanning... (${scanStats.postsScanned} posts, ${scanStats.imagesFound} images)`
                 : "Scan My Posts"}
@@ -924,7 +976,7 @@ const App: React.FC = () => {
             {error && <div className="error-banner">{error}</div>}
           </form>
 
-          {(loading || scanCircles.length > 0) && (
+          {(loading || generationRunning || scanCircles.length > 0) && (
             <div className="scan-progress-panel">
               <div className="scan-progress-header">
                 <strong>Scan/generation map</strong>
@@ -1003,6 +1055,44 @@ const App: React.FC = () => {
           )}
         </section>
 
+        <details className="card provider-card">
+          <summary>AI Provider <span className="provider-summary-hint">Optional</span></summary>
+          <p className="card-help">Optional: connect OpenAI or OpenRouter to generate image descriptions.</p>
+          <div className="login-form">
+            <label className="input-group">
+              <span>LLM API key</span>
+              <input type="password" autoComplete="off" spellCheck={false}
+                placeholder="Paste your provider API key" value={llmKey}
+                onChange={e => { invalidateProvider(); setLlmKey(e.target.value); }} />
+            </label>
+            <label className="input-group">
+              <span>Provider</span>
+              <select value={providerChoice} onChange={e => { invalidateProvider(); setProviderChoice(e.target.value); }}>
+                <option value="auto">Detect from key</option>
+                <option value="openai">OpenAI</option>
+                <option value="openrouter">OpenRouter</option>
+              </select>
+            </label>
+            <p className="card-help">{llmKey.trim().startsWith("sk-or-") ? "Detected: OpenRouter" :
+              /^(sk-proj-|sk-svcacct-)/.test(llmKey.trim()) ? "Detected: OpenAI" :
+              "Keys without a recognizable prefix require a provider selection."}</p>
+            <button type="button" className="primary-btn" disabled={!llmKey.trim() || modelsLoading} onClick={loadModels}>
+              {modelsLoading ? "Loading models…" : "Load models"}
+            </button>
+            {catalog && <label className="input-group">
+              <span>Model ({catalog.provider === "openai" ? "OpenAI" : "OpenRouter"})</span>
+              <select value={model} onChange={e => setModel(e.target.value)} disabled={!catalog.models.length}>
+                {!catalog.models.length && <option value="">No compatible models</option>}
+                {catalog.models.map(m => <option key={m.id} value={m.id}>{m.name} — {m.id}</option>)}
+              </select>
+            </label>}
+            {catalog && <p className="card-help">{catalog.note}</p>}
+            {providerError && <div className="error-banner" role="alert">{providerError}</div>}
+            {llmKey && <button type="button" className="filter-btn" onClick={() => { invalidateProvider(); setLlmKey(""); }}>Clear API key</button>}
+          </div>
+          <p className="key-privacy-note">Your key stays in memory and is sent via the local backend only to your AI provider. It is never saved to disk or browser storage.</p>
+        </details>
+
         {result && (
           <section className="card results-card">
             <div className="results-header">
@@ -1014,7 +1104,7 @@ const App: React.FC = () => {
               </p>
               <p className="altgen-status">
                 Alt-text generation:{" "}
-                {result.alt_generation_enabled ? (
+                {(generationConfig || result.alt_generation_enabled) ? (
                   <span className="badge badge-on">Enabled</span>
                 ) : (
                   <span className="badge badge-off">Disabled (no API key)</span>
@@ -1189,10 +1279,10 @@ const App: React.FC = () => {
                                   <em>(generating...)</em>
                                 ) : genStatus === "error" ? (
                                   <em>(generation error: {genErr || "unknown"})</em>
-                                ) : result.alt_generation_enabled ? (
+                                ) : (generationConfig || result.alt_generation_enabled) ? (
                                   <em>(no suggestion returned)</em>
                                 ) : (
-                                  <em>(configure OPENAI_API_KEY to enable suggestions)</em>
+                                  <em>(add an LLM API key above to enable suggestions)</em>
                                 )}
                               </span>
                             </div>
@@ -1201,6 +1291,7 @@ const App: React.FC = () => {
                               <span className="meta-label">Generation status</span>
                               <span className="meta-value">
                                 {genStatus ? genStatus : <em>not queued</em>}
+                                {genStatus === "error" && genErr && <span role="alert"> · {genErr}</span>}
                               </span>
                             </div>
 
@@ -1213,11 +1304,13 @@ const App: React.FC = () => {
                             </div>
 
                             <div className="meta-row">
+                              {generationRunning && <span className="card-help">To regenerate, wait for the batch to finish or use Stop Generation.</span>}
                               <button
                                 type="button"
                                 className="regen-btn"
                                 onClick={() => onRegenerateAlt(post, img)}
-                                disabled={!!regeneratingKeyMap[key]}
+                                disabled={loading || generationRunning || generationStopping || Object.values(regeneratingKeyMap).some(Boolean)}
+                                title={generationRunning ? "Wait for generation to finish, or stop the batch first." : undefined}
                               >
                                 {regeneratingKeyMap[key]
                                   ? "Regenerating..."

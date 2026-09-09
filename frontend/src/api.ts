@@ -312,7 +312,8 @@ export async function resumeApplyQueue(
 
 export async function startAltGeneration(
   handle: string,
-  items: GenerateAltItem[]
+  items: GenerateAltItem[],
+  generation?: GenerationConfig
 ): Promise<GenerateStartResponse> {
   const res = await fetch(`${API_BASE}/api/generate/start`, {
     method: "POST",
@@ -321,7 +322,8 @@ export async function startAltGeneration(
     },
     body: JSON.stringify({
       handle,
-      items
+      items,
+      generation
     })
   });
 
@@ -358,7 +360,8 @@ export async function stopAltGeneration(jobId: string): Promise<void> {
 
 export async function regenerateAltText(
   handle: string,
-  item: GenerateAltItem
+  item: GenerateAltItem,
+  generation?: GenerationConfig
 ): Promise<GenerateOneResponse> {
   const res = await fetch(`${API_BASE}/api/generate/one`, {
     method: "POST",
@@ -367,12 +370,36 @@ export async function regenerateAltText(
     },
     body: JSON.stringify({
       handle,
-      item
+      item,
+      generation
     })
   });
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `HTTP error ${res.status}`);
+  }
+  return res.json();
+}
+
+export interface GenerationConfig {
+  api_key: string;
+  provider: "openai" | "openrouter";
+  model: string;
+}
+export interface ProviderModels {
+  provider: "openai" | "openrouter";
+  models: {id: string; name: string}[];
+  note: string;
+}
+export async function discoverModels(api_key: string, provider: string): Promise<ProviderModels> {
+  const res = await fetch(`${API_BASE}/api/providers/models`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({api_key, provider})
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : "Unable to load models. Try again.");
   }
   return res.json();
 }

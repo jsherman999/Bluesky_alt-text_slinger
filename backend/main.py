@@ -19,7 +19,7 @@ from atproto_client.exceptions import RequestErrorBase
 
 try:
     from .alt_text_gen import is_enabled as altgen_is_enabled, generate_alt_text
-    from . import db
+    from . import db, providers
 except ImportError:  # Allows running as a script from backend/ during dev
     import os
     import sys
@@ -27,6 +27,7 @@ except ImportError:  # Allows running as a script from backend/ during dev
     sys.path.append(os.path.dirname(__file__))
     from alt_text_gen import is_enabled as altgen_is_enabled, generate_alt_text
     import db
+    import providers
 
 
 # ---------- Pydantic models ----------
@@ -121,6 +122,7 @@ class GenerateAltItem(BaseModel):
 
 
 class GenerateStartRequest(BaseModel):
+    generation: Optional[providers.GenerationConfig] = None
     handle: str
     items: List[GenerateAltItem]
 
@@ -131,6 +133,7 @@ class GenerateStartResponse(BaseModel):
 
 
 class GenerateOneRequest(BaseModel):
+    generation: Optional[providers.GenerationConfig] = None
     handle: str
     item: GenerateAltItem
 
@@ -211,74 +214,31 @@ def verify_alts_via_public_api(
     Verify applied alt-text through the public app-view API.
     Returns None when verification passes, otherwise an error string.
     """
-    encoded_uri = urllib.parse.quote(uri, safe="")
-    did, collection, rkey = parse_at_uri(uri)
-    repo_url = (
-        "https://public.api.bsky.app/xrpc/com.atproto.repo.getRecord"
-        f"?repo={urllib.parse.quote(did, safe='')}"
-        f"&collection={urllib.parse.quote(collection, safe='')}"
-        f"&rkey={urllib.parse.quote(rkey, safe='')}"
-    )
-    thread_url = (
+    parse_at_uri(uri)
+    # Verify the rendered images in the appview, not just repository storage.
+    url = (
         "https://public.api.bsky.app/xrpc/app.bsky.feed.getPostThread"
-        f"?uri={encoded_uri}&depth=0&parentHeight=0"
+        f"?uri={urllib.parse.quote(uri, safe='')}&depth=0&parentHeight=0"
     )
     last_error: Optional[str] = None
-
     for attempt in range(retries):
         try:
-            with urllib.request.urlopen(repo_url, timeout=10) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-            record = payload.get("value") or {}
-            embed = record.get("embed") or {}
-            embed_type = embed.get("$type") or embed.get("py_type") or ""
-            images: List[dict] = []
-            if embed_type == "app.bsky.embed.images":
-                images = embed.get("images") or []
-            elif embed_type == "app.bsky.embed.recordWithMedia":
-                media = embed.get("media") or {}
-                media_type = media.get("$type") or media.get("py_type") or ""
-                if media_type == "app.bsky.embed.images":
-                    images = media.get("images") or []
-
-            # Fallback to appview thread path if repo.getRecord did not return image embeds.
-            if not images:
-                with urllib.request.urlopen(thread_url, timeout=10) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                thread = payload.get("thread") or {}
-                post = thread.get("post") or {}
-                record = post.get("record") or {}
-                embed = record.get("embed") or {}
-                embed_type = embed.get("$type") or embed.get("py_type") or ""
-                if embed_type == "app.bsky.embed.images":
-                    images = embed.get("images") or []
-                elif embed_type == "app.bsky.embed.recordWithMedia":
-                    media = embed.get("media") or {}
-                    media_type = media.get("$type") or media.get("py_type") or ""
-                    if media_type == "app.bsky.embed.images":
-                        images = media.get("images") or []
-
-            mismatch = None
-            for idx, expected_alt in expected_by_index.items():
-                if idx < 0 or idx >= len(images):
-                    mismatch = f"Public verify: image index {idx} not found."
-                    break
-                live_alt = ((images[idx] or {}).get("alt") or "").strip()
-                if live_alt != expected_alt.strip():
-                    mismatch = (
-                        f"Public verify mismatch at image {idx}. "
-                        f"Expected '{expected_alt.strip()}', got '{live_alt}'."
-                    )
-                    break
-
+            payload = _fetch_json_url(url)
+            post = (payload.get("thread") or {}).get("post") or {}
+            images = _extract_postview_alt_from_payload({"posts": [post]})
+            live = {image["index"]: image["alt"].strip() for image in images}
+            mismatch = next(
+                (idx for idx, alt in expected_by_index.items()
+                 if idx not in live or live[idx] != alt.strip()),
+                None,
+            )
             if mismatch is None:
                 return None
-            last_error = mismatch
+            last_error = f"Public view does not yet show the expected alt text at image {mismatch}."
         except urllib.error.HTTPError as e:
             last_error = f"Public verify HTTP {e.code}"
         except Exception as e:
             last_error = f"Public verify error: {e}"
-
         if attempt < retries - 1:
             time.sleep(delay_seconds)
 
@@ -751,7 +711,8 @@ def _run_generation_job(job_id: str, req: GenerateStartRequest) -> None:
             if item.current_alt and item.current_alt.strip():
                 generated_alt = item.current_alt.strip()
             else:
-                generated_alt = generate_alt_text(item.fullsize_url, item.post_text)
+                generated_alt = (generate_alt_text(item.fullsize_url, item.post_text, config=req.generation)
+                                 if req.generation else generate_alt_text(item.fullsize_url, item.post_text))
                 if generated_alt:
                     job["generated_items"] += 1
                     db.record_generated_alt(
@@ -836,7 +797,7 @@ def scan_images_stream(req: ScanRequest) -> StreamingResponse:
 
 @app.post("/api/generate/start", response_model=GenerateStartResponse)
 def generate_start(req: GenerateStartRequest) -> GenerateStartResponse:
-    if not altgen_is_enabled():
+    if not req.generation and not altgen_is_enabled():
         raise HTTPException(
             status_code=400,
             detail="Alt-text generation is disabled. Configure OPENAI_API_KEY.",
@@ -871,7 +832,7 @@ def generate_start(req: GenerateStartRequest) -> GenerateStartResponse:
         },
     )
 
-    job_req = GenerateStartRequest(handle=handle, items=filtered_items)
+    job_req = GenerateStartRequest(handle=handle, items=filtered_items, generation=req.generation)
     threading.Thread(target=_run_generation_job, args=(job_id, job_req), daemon=True).start()
     return GenerateStartResponse(job_id=job_id, total_items=len(filtered_items))
 
@@ -903,7 +864,7 @@ def generate_events(job_id: str, after: int = Query(default=0, ge=0)) -> Generat
 
 @app.post("/api/generate/one", response_model=GenerateOneResponse)
 def generate_one(req: GenerateOneRequest) -> GenerateOneResponse:
-    if not altgen_is_enabled():
+    if not req.generation and not altgen_is_enabled():
         raise HTTPException(
             status_code=400,
             detail="Alt-text generation is disabled. Configure OPENAI_API_KEY or OPENROUTER_API_KEY.",
@@ -912,7 +873,8 @@ def generate_one(req: GenerateOneRequest) -> GenerateOneResponse:
     handle = normalize_handle(req.handle)
     item = req.item
     try:
-        generated_alt = generate_alt_text(item.fullsize_url, item.post_text)
+        generated_alt = (generate_alt_text(item.fullsize_url, item.post_text, config=req.generation)
+                                 if req.generation else generate_alt_text(item.fullsize_url, item.post_text))
         if generated_alt and generated_alt.strip():
             db.record_generated_alt(
                 handle,
@@ -1060,7 +1022,7 @@ def _apply_updates_for_uri(
             collection=collection,
             rkey=rkey,
         )
-    verify_record = getattr(verify_resp, "value", None)
+    verify_record = get_field(verify_resp, "value")
     if hasattr(verify_record, "model_dump"):
         verify_record = verify_record.model_dump(by_alias=True, exclude_none=True)
     if not isinstance(verify_record, dict):
@@ -1090,33 +1052,16 @@ def _apply_updates_for_uri(
 
     if verify_public:
         expected_by_index = {upd.image_index: upd.new_alt for upd in updates}
-        public_verify_error = verify_alts_via_public_api(uri, expected_by_index)
+        public_verify_error = verify_alts_via_public_api(
+            uri, expected_by_index, retries=1, delay_seconds=0.0
+        )
         if public_verify_error:
-            debug_suffix = ""
-            pds_has_expected = False
-            try:
-                cmp = debug_compare_alt_views(uri)
-                pds_alts = cmp.get("pds_record_alts") or []
-                public_repo_alts = cmp.get("public_repo_alts") or []
-                public_thread_alts = cmp.get("public_thread_record_alts") or []
-                pds_map = {int(x.get("index", -1)): str(x.get("alt") or "") for x in pds_alts}
-                pds_has_expected = all(
-                    pds_map.get(int(idx), "").strip() == str(expected).strip()
-                    for idx, expected in expected_by_index.items()
-                )
-                debug_suffix = (
-                    f" | debug pds_alts={pds_alts[:4]} "
-                    f"public_repo_alts={public_repo_alts[:4]} "
-                    f"public_thread_record_alts={public_thread_alts[:4]}"
-                )
-            except Exception as dbg_e:
-                debug_suffix = f" | debug compare failed: {dbg_e}"
-            if pds_has_expected:
-                raise PropagationPendingError(
-                    "PDS accepted alt updates, waiting for public appview propagation."
-                    + debug_suffix
-                )
-            raise RuntimeError(public_verify_error + debug_suffix)
+            # The authenticated read above already confirmed persistence. Never
+            # rewrite a confirmed record just because the appview is behind.
+            raise PropagationPendingError(
+                "PDS accepted alt updates; public visibility is unconfirmed. "
+                + public_verify_error
+            )
 
     out: List[ApplyResultItem] = []
     for upd in updates:
@@ -1185,6 +1130,17 @@ def apply_alt_updates(req: ApplyRequest) -> ApplyResponse:
 
 
 def _run_apply_queue_worker(job_id: str) -> None:
+    try:
+        _process_apply_queue(job_id)
+    except Exception as exc:
+        db.requeue_running_items(job_id, error=str(exc))
+        db.set_apply_job_status(job_id, "paused", pause_reason=f"Queue interrupted: {exc}")
+    finally:
+        with APPLY_JOBS_LOCK:
+            APPLY_JOBS.pop(job_id, None)
+
+
+def _process_apply_queue(job_id: str) -> None:
     with APPLY_JOBS_LOCK:
         runtime = APPLY_JOBS.get(job_id)
     if not runtime:
@@ -1202,7 +1158,7 @@ def _run_apply_queue_worker(job_id: str) -> None:
 
     last_run_at = 0.0
     last_propagation_check_at = 0.0
-    max_propagation_checks = 36  # ~6 minutes at 10s cadence before hard failure
+    max_propagation_checks = 6  # Bounded, fair checks; public edits may never appear.
     while True:
         with APPLY_JOBS_LOCK:
             rt = APPLY_JOBS.get(job_id)
@@ -1275,7 +1231,8 @@ def _run_apply_queue_worker(job_id: str) -> None:
                     next_attempt = max(int(x.get("attempts", 0)) for x in prop_group) + 1
                     if next_attempt >= max_propagation_checks:
                         fail_msg = (
-                            "Public appview did not reflect PDS alt updates after repeated checks. "
+                            "Saved to PDS, but Bluesky still does not display the updated alt text. "
+                            "Bluesky may ignore edits to existing posts; more retries may not help. "
                             f"Last verify: {pub_err}"
                         )
                         print(f"[apply-queue] Propagation timeout for {p_uri}: {fail_msg}")
@@ -1466,7 +1423,9 @@ def apply_queue_resume(
         if rt:
             rt["manual_paused"] = False
             rt["stop_requested"] = False
-            rt["pause_until_ts"] = None
+            reset_at = rt.get("pause_until_ts")
+            if reset_at and reset_at > time.time():
+                return {"status": "paused"}
             db.set_apply_job_status(job_id, "running", pause_reason=None, rate_limit_reset_at=None)
             return {"status": "running"}
 
@@ -1536,3 +1495,15 @@ def debug_alt_compare(uri: str) -> dict:
         return debug_compare_alt_views(uri)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Alt compare failed: {e}") from e
+
+
+@app.post("/api/providers/models")
+def provider_models(req: providers.ProviderKey) -> dict:
+    try:
+        providers.identify(req)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    try:
+        return providers.discover(req)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=providers.public_error(exc)) from None

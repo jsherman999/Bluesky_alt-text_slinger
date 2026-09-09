@@ -402,7 +402,7 @@ def claim_next_propagating_uri_group(job_id: str) -> List[Dict[str, Any]]:
         SELECT uri
         FROM apply_job_items
         WHERE job_id = ? AND status = 'propagating'
-        ORDER BY id ASC
+        ORDER BY attempts ASC, id ASC
         LIMIT 1;
         """,
         (job_id,),

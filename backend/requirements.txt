@@ -3,3 +3,4 @@ uvicorn[standard]
 atproto
 python-multipart
 openai
+httpx

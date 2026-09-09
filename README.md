@@ -95,3 +95,40 @@ Frontend defaults API base to `http://<current-host>:8000`.
 - Use a Bluesky app password, not your account password.
 - Apply queue can show `propagating` when PDS accepted writes but public appview has not converged.
 - Local DB state is advisory; public verification is required for end-user-visible success.
+
+## Reliability checks
+
+```bash
+.venv/bin/pip install pytest
+.venv/bin/python -m pytest -q
+cd frontend && npm run build
+```
+
+See [test results](docs/TEST_RESULTS.md) for the reliability fixes, regression
+coverage, and authenticated testing still needed. A successful PDS write is not
+proof that Bluesky displays the updated image description. Delayed public
+verification is bounded, and the queue reports images whose public visibility
+could not be confirmed.
+
+## Configure AI in the web UI
+
+Use **AI provider** above the Bluesky login form. Paste your OpenAI or OpenRouter
+key, choose **Load models**, then select an image-description model. OpenRouter
+and OpenAI project/service-account prefixes are recognized automatically; choose
+a provider explicitly for ambiguous prefixes. Other providers are not supported.
+
+The model selection is used for the next scan's automatic generation and for
+individual **Regenerate alt-text** actions. Existing cached suggestions are reused.
+Running jobs keep the settings they started with. Clear the key to return to
+backend environment configuration, if present.
+
+Keys entered here live in page memory and request/job memory on the local backend;
+they are not written to SQLite, browser storage, or files. Refresh clears the page
+key. The selected provider receives the key and generation inputs. A future
+GitHub Pages implementation would make these provider calls from the browser.
+
+OpenRouter models are filtered using image-input/text-output metadata. OpenAI's
+model list lacks modality metadata, so its dropdown includes supported GPT-4o,
+GPT-4.1 and GPT-5 families with specialized variants excluded. Model listings do
+not guarantee credits or access to every listed model. Catalog and request paths
+are covered by mocked tests; a user key is needed to validate live provider access.

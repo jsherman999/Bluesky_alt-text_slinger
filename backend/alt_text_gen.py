@@ -2,6 +2,10 @@ import os
 from typing import Optional
 
 from openai import OpenAI  # pip install openai
+try:
+    from . import providers
+except ImportError:
+    import providers
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -14,7 +18,7 @@ ALTGEN_X_TITLE = os.getenv("ALTGEN_X_TITLE", "Bluesky Alt-Text Slinger")
 _client: Optional[OpenAI] = None
 _default_model = "gpt-4o-mini"
 if OPENAI_API_KEY:
-    _client = OpenAI(api_key=OPENAI_API_KEY)
+    _client = OpenAI(api_key=OPENAI_API_KEY, timeout=30.0, max_retries=1)
 elif OPENROUTER_API_KEY:
     # OpenRouter exposes an OpenAI-compatible API.
     base_url = ALTGEN_BASE_URL or "https://openrouter.ai/api/v1"
@@ -25,6 +29,8 @@ elif OPENROUTER_API_KEY:
         headers["X-Title"] = ALTGEN_X_TITLE
     _client = OpenAI(
         api_key=OPENROUTER_API_KEY,
+        timeout=30.0,
+        max_retries=1,
         base_url=base_url,
         default_headers=headers or None,
     )
@@ -41,14 +47,22 @@ def is_enabled() -> bool:
     return _client is not None
 
 
-def generate_alt_text(image_url: str, post_text: Optional[str] = None) -> Optional[str]:
+def generate_alt_text(image_url: str, post_text: Optional[str] = None, config: Optional[providers.GenerationConfig] = None) -> Optional[str]:
     """
     Generate concise alt-text for the given image URL using an OpenAI
     vision-capable chat model (e.g. gpt-4o / gpt-4o-mini).
 
-    Returns a 1–2 sentence description, or None on error.
+    Returns a 1–2 sentence description. Provider errors propagate to job status.
     """
-    if not _client:
+    if config:
+        provider = providers.identify(config)
+        client = OpenAI(api_key=config.api_key.get_secret_value().strip(),
+                        base_url=providers.BASE_URLS[provider], timeout=30.0, max_retries=1)
+        model = config.model
+    else:
+        client, model = _client, ALTGEN_MODEL
+        provider = 'openai' if OPENAI_API_KEY else 'openrouter'
+    if not client:
         return None
 
     context_snippet = (post_text or "").strip()
@@ -62,7 +76,7 @@ def generate_alt_text(image_url: str, post_text: Optional[str] = None) -> Option
         f"Here is optional context from the post: {context_snippet or '(no extra context)'}"
     )
 
-    model_lc = ALTGEN_MODEL.lower()
+    model_lc = model.lower()
     use_system_message = "gemma" not in model_lc
     if use_system_message:
         messages = [
@@ -100,14 +114,29 @@ def generate_alt_text(image_url: str, post_text: Optional[str] = None) -> Option
         ]
 
     try:
-        resp = _client.chat.completions.create(
-            model=ALTGEN_MODEL,
-            messages=messages,
-            max_tokens=ALTGEN_MAX_TOKENS,
-            temperature=0.2,
-        )
-        text = resp.choices[0].message.content or ""
-        return text.strip() or None
+        if config and provider == 'openai':
+            resp = client.responses.create(
+                model=model, store=False,
+                input=[{"role": "user", "content": [
+                    {"type": "input_text", "text": user_prompt},
+                    {"type": "input_image", "image_url": image_url},
+                ]}],
+                max_output_tokens=2048,
+            )
+            text = resp.output_text or ""
+        else:
+            resp = client.chat.completions.create(
+                model=model, messages=messages,
+                max_tokens=max(ALTGEN_MAX_TOKENS, 512) if config else ALTGEN_MAX_TOKENS,
+            )
+            text = resp.choices[0].message.content or ""
+        if not text.strip():
+            raise RuntimeError("The alt-text provider returned an empty response.")
+        return text.strip()
     except Exception as e:
-        print(f"[alt_text_gen] Error generating alt-text: {e}")
-        return None
+        if config:
+            raise RuntimeError(providers.public_error(e)) from None
+        raise RuntimeError(f"Alt-text generation failed: {e}") from e
+    finally:
+        if config:
+            client.close()

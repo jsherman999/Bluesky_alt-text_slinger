@@ -53,3 +53,19 @@ scripts/pds_inspect.sh watch-compare --handle <handle> --rkey <rkey>
 - Do not treat local DB `applied` state alone as proof of user-visible success.
 - Prefer public verification for final status.
 - Surface propagation state clearly in UI so users can distinguish local write vs public visibility.
+
+## Verification and retry behavior
+
+Public verification now reads the rendered image embed from `getPostThread`.
+Repository storage alone is insufficient evidence of visibility. Each confirmed
+write gets one public check; delayed posts rotate fairly through a bounded
+verification queue instead of blocking each subsequent write on repeated reads.
+After six unsuccessful checks, the item reports that it was saved to PDS but
+could not be confirmed publicly. The job completes with those items marked
+failed; this does not mean the PDS write was rolled back.
+
+An upstream discussion describes public post edits being ignored rather than
+merely delayed: https://github.com/bluesky-social/atproto/discussions/3038.
+Treat this as a possible platform limitation; retries cannot guarantee that
+an existing post edit will appear. Never automatically delete and recreate a
+post as a retry strategy.

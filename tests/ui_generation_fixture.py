@@ -48,3 +48,8 @@ def regenerate():
     global calls
     calls += 1
     return {'error':'Provider quota reached.', 'generated_alt':None} if calls == 1 else {'generated_alt':'New suggestion','error':None}
+
+@app.post('/api/generate/reset-drafts')
+def reset():
+    return {'images': [{'uri': uri, 'image_index': 0, 'alt': ''},
+                       {'uri': uri, 'image_index': 1, 'alt': 'Saved on Bluesky'}]}

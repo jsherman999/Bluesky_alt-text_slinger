@@ -16,7 +16,7 @@ import {
   pollAltGenerationEvents,
   stopAltGeneration,
   GenerateJobEvent,
-  regenerateAltText, discoverModels, ProviderModels, GenerationConfig
+  regenerateAltText, resetGenerationDrafts, discoverModels, ProviderModels, GenerationConfig
 } from "./api";
 
 function formatDate(dateStr?: string | null): string {
@@ -98,6 +98,7 @@ const App: React.FC = () => {
   };
   const [handle, setHandle] = useState("");
   const [appPassword, setAppPassword] = useState("");
+  const [resettingDrafts, setResettingDrafts] = useState(false);
   const [loading, setLoading] = useState(false);
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -491,7 +492,7 @@ const App: React.FC = () => {
 
   const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (generationRunning || generationStopping || regenerationInFlight.current || loading) return;
+    if (resettingDrafts || generationRunning || generationStopping || regenerationInFlight.current || loading) return;
     setError(null);
     setApplyMessage(null);
     setResult(null);
@@ -617,6 +618,56 @@ const App: React.FC = () => {
     }
   };
 
+  const onDiscardAndRegenerate = async () => {
+    if (!result || loading || resettingDrafts || generationRunning || generationStopping || regenerationInFlight.current ||
+        (applyQueueState && applyQueueState.status !== "completed")) return;
+    if ((!generationConfig && !result.alt_generation_enabled) || (llmKey.trim() && !generationConfig)) {
+      setError("Connect an AI provider and select a model before starting a fresh run.");
+      return;
+    }
+    setResettingDrafts(true);
+    setError(null);
+    let cleared = false;
+    try {
+      const items = result.posts.flatMap(post => post.images.map(img => ({
+        uri: post.uri, image_index: img.index, fullsize_url: img.fullsize_url,
+        post_text: post.text || "", current_alt: img.alt
+      })));
+      const saved = await resetGenerationDrafts(result.handle, appPassword, items);
+      const savedMap = new Map(saved.images.map(img => [makeKey(img.uri, img.image_index), img.alt]));
+      const clean = {...result, posts: result.posts.map(post => ({...post, images: post.images.map(img => ({
+        ...img, alt: savedMap.get(makeKey(post.uri, img.index)) || "", generated_alt: null, apply_status: null
+      }))}))};
+      cleared = true;
+      setResult(clean);
+      initAltStateFromResult(clean);
+      setImageGenError({}); setImageGenStatus({});
+      setApplyJobId(null); setApplyQueueState(null); setApplyItemStatus({});
+      setApplyProcessed(0); setApplyTotal(0); setActiveApplyUri(null);
+      setGenerationJobId(null); lastGenSeqRef.current = 0;
+      setGenerationProcessed(0);
+      const pending = items.filter(item => !(savedMap.get(makeKey(item.uri, item.image_index)) || "").trim())
+        .map(item => ({...item, current_alt: ""}));
+      setGenerationTotal(pending.length);
+      setScanCircles(prev => prev.map(circle => {
+        const post = clean.posts.find(p => p.uri === circle.uri);
+        if (!post) return circle;
+        const missing = post.images.filter(img => !img.alt.trim()).length;
+        return {...circle, missingPending: missing, status: missing ? "red" : "green"};
+      }));
+      setApplyMessage("Unpublished drafts discarded. Alt text saved to Bluesky was preserved.");
+      if (pending.length) {
+        const started = await startAltGeneration(result.handle, pending, generationConfig);
+        setImageGenStatus(Object.fromEntries(pending.map(item => [makeKey(item.uri, item.image_index), "queued"])));
+        setGenerationJobId(started.job_id); setGenerationRunning(true);
+      }
+    } catch (err) {
+      setError(`${cleared ? "Drafts were cleared, but the new run could not start. " : ""}${err instanceof Error ? err.message : "Unable to restart generation."}`);
+    } finally {
+      setResettingDrafts(false);
+    }
+  };
+
   const onStopGeneration = async () => {
     if (!generationJobId || !generationRunning || generationStopping) return;
     setGenerationStopping(true);
@@ -630,7 +681,7 @@ const App: React.FC = () => {
   };
 
   const onRegenerateAlt = async (post: PostInfo, img: ImageInfo) => {
-    if (generationRunning || generationStopping || loading || regenerationInFlight.current) return;
+    if (resettingDrafts || generationRunning || generationStopping || loading || regenerationInFlight.current) return;
     if (llmKey.trim() && !generationConfig) {
       setProviderError("Load models and choose a model before regenerating.");
       return;
@@ -967,7 +1018,7 @@ const App: React.FC = () => {
               />
             </label>
 
-            <button type="submit" className="primary-btn" disabled={loading || generationRunning || Object.values(regeneratingKeyMap).some(Boolean)}>
+            <button type="submit" className="primary-btn" disabled={resettingDrafts || loading || generationRunning || Object.values(regeneratingKeyMap).some(Boolean)}>
               {loading
                 ? `Scanning... (${scanStats.postsScanned} posts, ${scanStats.imagesFound} images)`
                 : "Scan My Posts"}
@@ -1116,10 +1167,17 @@ const App: React.FC = () => {
 
             <div className="top-controls">
               <div className="apply-controls">
+                <button type="button" className="filter-btn" onClick={onDiscardAndRegenerate}
+                  disabled={resettingDrafts || loading || generationRunning || generationStopping || Object.values(regeneratingKeyMap).some(Boolean) || !!(applyQueueState && applyQueueState.status !== "completed")}>
+                  {resettingDrafts ? "Checking saved alt text…" : "Discard drafts and regenerate"}
+                </button>
+                <span className="apply-hint">Discards all unpublished suggestions and manual edits in these results. Preserves saved Bluesky alt text. Finish or stop generation and finish any apply queue first.</span>
+              </div>
+              <div className="apply-controls">
                 <button
                   type="button"
                   className="primary-btn"
-                  disabled={applying && applyQueueState?.status === "running"}
+                  disabled={resettingDrafts || (applying && applyQueueState?.status === "running")}
                   onClick={onApplyChanges}
                 >
                   {applying ? "Queue Running..." : "Apply Selected Alt Text"}
@@ -1309,7 +1367,7 @@ const App: React.FC = () => {
                                 type="button"
                                 className="regen-btn"
                                 onClick={() => onRegenerateAlt(post, img)}
-                                disabled={loading || generationRunning || generationStopping || Object.values(regeneratingKeyMap).some(Boolean)}
+                                disabled={resettingDrafts || loading || generationRunning || generationStopping || Object.values(regeneratingKeyMap).some(Boolean)}
                                 title={generationRunning ? "Wait for generation to finish, or stop the batch first." : undefined}
                               >
                                 {regeneratingKeyMap[key]

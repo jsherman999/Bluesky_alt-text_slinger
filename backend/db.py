@@ -631,3 +631,23 @@ def mark_stale_running_jobs_paused() -> None:
     )
     conn.commit()
     conn.close()
+
+
+def reset_drafts(handle: str, saved_alts: List[Dict[str, Any]]) -> None:
+    """Replace only local drafts with freshly read Bluesky alt text, atomically."""
+    with _get_conn() as conn:
+        for item in saved_alts:
+            conn.execute(
+                """UPDATE images SET generated_alt = NULL, current_alt = ?,
+                   last_status = 'scanned', updated_at = datetime('now')
+                   WHERE handle = ? AND post_uri = ? AND image_index = ?""",
+                (item['alt'], handle, item['uri'], item['image_index']),
+            )
+
+
+def has_unfinished_apply_job(handle: str) -> bool:
+    with _get_conn() as conn:
+        return conn.execute(
+            "SELECT 1 FROM apply_jobs WHERE handle = ? AND status != 'completed' LIMIT 1",
+            (handle,),
+        ).fetchone() is not None

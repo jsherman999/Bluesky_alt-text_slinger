@@ -132,3 +132,17 @@ model list lacks modality metadata, so its dropdown includes supported GPT-4o,
 GPT-4.1 and GPT-5 families with specialized variants excluded. Model listings do
 not guarantee credits or access to every listed model. Catalog and request paths
 are covered by mocked tests; a user key is needed to validate live provider access.
+
+## Discard unpublished alt text and start again
+
+In Scan Results, choose **Discard drafts and regenerate**. This discards all
+unpublished suggestions and manual edits in the current results, regardless of
+filter or selection. It reads the account's stored Bluesky records first,
+restores any saved alt text, clears the local suggestion cache, and starts a
+fresh batch only for images without saved alt text. No Bluesky records are
+changed by discarding drafts; publishing still requires Apply.
+
+Stop generation and wait for it to finish first. Any apply queue, including a
+paused one, must finish before drafts can be discarded. If saved text cannot be
+verified, no drafts are cleared. A configured AI provider is required to start
+the replacement run.

@@ -1507,3 +1507,46 @@ def provider_models(req: providers.ProviderKey) -> dict:
         return providers.discover(req)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=providers.public_error(exc)) from None
+
+
+class ResetDraftsRequest(BaseModel):
+    handle: str
+    app_password: str
+    items: List[GenerateAltItem]
+
+
+@app.post('/api/generate/reset-drafts')
+def reset_generation_drafts(req: ResetDraftsRequest) -> dict:
+    handle = normalize_handle(req.handle)
+    with GEN_JOBS_LOCK:
+        if any(j['handle'] == handle and not j['done'] for j in GEN_JOBS.values()):
+            raise HTTPException(409, 'Stop generation and wait for it to finish before discarding drafts.')
+    if db.has_unfinished_apply_job(handle):
+        raise HTTPException(409, 'Finish the apply queue before discarding drafts, including paused queues.')
+    client = Client()
+    try:
+        me = client.login(handle, req.app_password)
+        owner = get_field(me, 'did')
+        records = {}
+        saved = []
+        for item in req.items:
+            did, collection, rkey = parse_at_uri(item.uri)
+            if did != owner or collection != 'app.bsky.feed.post':
+                raise ValueError('Only posts belonging to the signed-in account can be reset.')
+            if item.uri not in records:
+                response = client.com.atproto.repo.get_record(params={
+                    'repo': did, 'collection': collection, 'rkey': rkey})
+                value = get_field(response, 'value')
+                if hasattr(value, 'model_dump'):
+                    value = value.model_dump(by_alias=True, exclude_none=True)
+                records[item.uri] = _extract_record_alt_from_payload({'value': value})
+            alts = records[item.uri]
+            if item.image_index < 0 or item.image_index >= len(alts):
+                raise ValueError('An image changed or was removed. Scan again before discarding drafts.')
+            saved.append({'uri': item.uri, 'image_index': item.image_index,
+                          'alt': alts[item.image_index]['alt']})
+    except Exception:
+        # Do not clear anything unless every requested image has been read.
+        raise HTTPException(400, 'Could not verify saved Bluesky alt text. Check your login and connection, then scan again. Drafts were not cleared.') from None
+    db.reset_drafts(handle, saved)
+    return {'images': saved}

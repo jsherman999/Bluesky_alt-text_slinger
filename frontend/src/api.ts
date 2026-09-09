@@ -403,3 +403,15 @@ export async function discoverModels(api_key: string, provider: string): Promise
   }
   return res.json();
 }
+
+export async function resetGenerationDrafts(handle: string, app_password: string, items: GenerateAltItem[]): Promise<{images: {uri: string; image_index: number; alt: string}[]}> {
+  const res = await fetch(`${API_BASE}/api/generate/reset-drafts`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({handle, app_password, items})
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(typeof body.detail === "string" ? body.detail : "Could not discard drafts.");
+  }
+  return res.json();
+}

@@ -53,3 +53,13 @@ Vite instance (no real credentials or provider calls):
 All 14 backend tests and the frontend type check/production build also pass.
 The original user's provider error was not visible in the inspected tab, so its
 specific cause has not been confirmed.
+
+## Discard drafts and regenerate
+
+19 backend tests pass. New tests verify authoritative stored alt text is
+preserved, cached drafts are cleared, remote verification failures leave drafts
+untouched, other-account records are rejected, and unfinished generation/apply
+jobs block the reset. Browser fixture verification confirmed unpublished manual
+edits disappear, stored Bluesky text remains, and a fresh generation batch starts.
+The TypeScript check and production build pass. These reset tests use simulated
+Bluesky records; no real account drafts or posts were discarded during testing.
